@@ -1,9 +1,12 @@
 array_record
 datasets
 flax
-gcsfuse
+gcsfs
 google-cloud-storage
 grain-nightly
+hf_transfer
+jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
 orbax-checkpoint
 optax
+tpu-info
 transformers
