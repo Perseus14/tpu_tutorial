@@ -1,12 +1,12 @@
-array_record
-datasets
-flax
-gcsfs
-google-cloud-storage
-grain-nightly
-hf_transfer
-jax[tpu] -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
-orbax-checkpoint
-optax
-tpu-info
-transformers
+array_record==0.8.3
+datasets==4.6.1
+flax==0.12.4
+gcsfs==2026.2.0
+google-cloud-storage==3.9.0
+grain-nightly==0.2.16.dev20260112
+hf_transfer==0.1.9
+jax[tpu]==0.9.1 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+orbax-checkpoint==0.11.33
+optax==0.2.6
+tpu-info==0.8.1
+transformers==5.2.0

@@ -1,6 +1,13 @@
 import argparse
 import os
+# --- SILENCE BACKEND LOGS ---
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "true"
+# Silences TensorFlow/XLA C++ INFO and WARNING logs
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2" 
+# Silences Google Cloud / gRPC C++ INFO logs (like the auth provider)
+os.environ["GLOG_minloglevel"] = "2"
+os.environ["GRPC_VERBOSITY"] = "ERROR"
+# ----------------------------
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -19,32 +26,62 @@ def print(*args, **kwargs):
     if jax.process_index() == 0:
         builtin_print(*args, **kwargs)
 
+
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+
+def print_divider(color=Colors.CYAN, char="=", length=60):
+    print(f"{color}{char * length}{Colors.RESET}")
+
 # ==========================================
 # 1. Configuration
 # ==========================================
 @dataclass
 class TrainConfig:
-    batch_size: int = 1024 # Global batch size (will be sharded across devices)
+    batch_size: int = 1024              # Global batch size (will be sharded across devices)
+    accumulation_steps: int = 16        # 1024 / 16 = 64 (Our physical micro-batch size)
     max_learning_rate: float = 1.5e-4
     min_learning_rate: float = 1.5e-5
-    warmup_steps: int = 2500
-    total_steps: int = 100000
     
-    train_data_path: str = f"gs://{BUCKET_NAME}/toy_llm/data/openwebtext_train_full.arrayrecord"
-    val_data_path: str = f"gs://{BUCKET_NAME}/toy_llm/data/openwebtext_val_full.arrayrecord"
-    checkpoint_dir: str = f"gs://{BUCKET_NAME}/toy_llm/checkpoints/"
-    
-    vocab_size: int = 50257
+    vocab_size: int = 50304             # Padding to nearest multiple of 128
     d_model: int = 1024
     num_heads: int = 16
     num_layers: int = 24
     max_seq_len: int = 1024
 
+    train_data_path: str = f"gs://{BUCKET_NAME}/toy_llm/data/openwebtext_train_full.arrayrecord"
+    val_data_path: str = f"gs://{BUCKET_NAME}/toy_llm/data/openwebtext_val_full.arrayrecord"
+    checkpoint_dir: str = f"gs://{BUCKET_NAME}/toy_llm/checkpoints/"
+
+    warmup_steps: int = 500         # ~5% of training spent warming up    
+    total_steps: int = 10000        # Processes ~5.2 Billion tokens
+    
+    log_interval: int = 100
     save_every_n_steps: int = 5000
     eval_every_n_steps: int = 2500
     generate_every_n_steps: int = 1000
     max_generate_length: int = 100
-
+    
+    '''
+    # --- SMOKE TEST OVERRIDES ---
+    total_steps: int = 100        # Finish the whole script in minutes
+    warmup_steps: int = 10        # Must be lower than total_steps!
+    
+    log_interval: int = 1
+    save_every_n_steps: int = 50  # Forces a save at step 50 and 100
+    eval_every_n_steps: int = 25  # Forces eval at 25, 50, 75, 100
+    generate_every_n_steps: int = 25 # Forces text generation 4 times
+    max_generate_length: int = 20    # Keep generation short so you don't wait
+    # ----------------------------
+    '''
+    
     dtype: any = jnp.bfloat16
 
 config = TrainConfig()
@@ -94,10 +131,6 @@ def get_dataloader(file_path: str, batch_size: int, is_training: bool):
 # ==========================================
 # 3. NNX NanoGPT Model
 # ==========================================
-class KVCache(nnx.Variable):
-    """A custom variable type so the optimizer ignores the cache during training."""
-    pass
-
 class TransformerBlock(nnx.Module):
     def __init__(self, d_model: int, num_heads: int, max_seq_len: int, dtype: jnp.dtype, rngs: nnx.Rngs):
         self.num_heads = num_heads
@@ -115,11 +148,7 @@ class TransformerBlock(nnx.Module):
         self.mlp_fc1 = nnx.Linear(d_model, 4 * d_model, dtype=dtype, rngs=rngs)
         self.mlp_fc2 = nnx.Linear(4 * d_model, d_model, dtype=dtype, rngs=rngs)
 
-        # Initialize KV Cache (Shape: Batch=1, MaxSeqLen, Heads, HeadDim)
-        self.cache_k = KVCache(jnp.zeros((1, max_seq_len, num_heads, self.head_dim), dtype=dtype))
-        self.cache_v = KVCache(jnp.zeros((1, max_seq_len, num_heads, self.head_dim), dtype=dtype))
-
-    def __call__(self, x, mask, cache_index=None):
+    def __call__(self, x, mask):
         residual = x
         x = self.ln1(x)
         
@@ -128,24 +157,8 @@ class TransformerBlock(nnx.Module):
         k = self.k_proj(x).reshape(B, L, self.num_heads, self.head_dim)
         v = self.v_proj(x).reshape(B, L, self.num_heads, self.head_dim)
 
-        if cache_index is not None:
-            # --- DECODE MODE (KV Cache) ---
-            # Insert the new token's K and V into the cache array at the current index
-            self.cache_k[...] = jax.lax.dynamic_update_slice(self.cache_k[...], k, (0, cache_index, 0, 0))
-            self.cache_v[...] = jax.lax.dynamic_update_slice(self.cache_v[...], v, (0, cache_index, 0, 0))
-            k_use, v_use = self.cache_k[...], self.cache_v[...]
-        else:
-            # --- TRAIN MODE ---
-            k_use, v_use = k, v
-
-        # Attention: (B, L, H, D) x (B, Seq, H, D) -> (B, H, L, Seq)
-        scores = jnp.einsum('bqhd,bkhd->bhqk', q, k_use) / jnp.sqrt(self.head_dim)
-        
-        if mask is not None:
-            scores = jnp.where(mask, scores, -1e5)
-            
-        attn_weights = jax.nn.softmax(scores, axis=-1)
-        attn_out = jnp.einsum('bhqk,bkhd->bqhd', attn_weights, v_use)
+        # Look! Just pure, stateless Flash Attention!
+        attn_out = jax.nn.dot_product_attention(q, k, v, mask=mask)
         attn_out = attn_out.reshape(B, L, self.d_model)
         
         x = residual + self.o_proj(attn_out)
@@ -170,89 +183,114 @@ class NanoGPT(nnx.Module):
         self.ln_f = nnx.LayerNorm(d_model, dtype=jnp.float32, rngs=rngs)
         self.lm_head = nnx.Linear(d_model, vocab_size, dtype=dtype, rngs=rngs)
 
-    def __call__(self, x, cache_index=None):
+    def __call__(self, x):
         batch_size, seq_len = x.shape
         tok_embeddings = self.tok_emb(x)
         
-        if cache_index is not None:
-            # Generate Mode: Positional index is just the current scalar cache_index
-            pos_indices = jnp.expand_dims(cache_index, 0)
-            # Mask allows attending to all previous tokens up to current cache_index
-            mask = jnp.arange(self.max_seq_len) <= cache_index
-            mask = mask[None, None, None, :] 
-        else:
-            # Train Mode: Full causal masking
-            pos_indices = jnp.arange(seq_len)
-            mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))[None, None, :, :]
+        pos_indices = jnp.arange(seq_len)
+        mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=jnp.bool_))[None, None, :, :]
             
         x = tok_embeddings + self.pos_emb(pos_indices)[None, :]
 
         apply_blocks = nnx.scan(
-            nnx.remat(lambda carry_x, blocks, m, c_idx: blocks(carry_x, mask=m, cache_index=c_idx)),
-            in_axes=(nnx.Carry, 0, None, None), 
+            nnx.remat(lambda carry_x, blocks, m: blocks(carry_x, mask=m)),
+            in_axes=(nnx.Carry, 0, None), 
             out_axes=nnx.Carry
         )
 
-        # Execute it
-        x = apply_blocks(x, self.blocks, mask, cache_index)
-
-        return self.lm_head(self.ln_f(x))
+        x = apply_blocks(x, self.blocks, mask)
+        x = self.ln_f(x)
+        logits = x @ self.tok_emb.embedding[...].T
+        return logits
 
 # ==========================================
 # 4. Step Functions & Generation
 # ==========================================
 def loss_fn(model: NanoGPT, batch: dict):
     logits = model(batch['x'])
+    logits = logits.astype(jnp.float32)
     loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits, labels=batch['y'])
     return jnp.mean(loss)
 
 @nnx.jit(donate_argnames=("model", "optimizer"))
-def train_step(model: NanoGPT, optimizer: nnx.Optimizer, batch: dict):
-    loss, grads = nnx.value_and_grad(loss_fn)(model, batch)
-    optimizer.update(model, grads)
-    return loss
+def train_step(model: NanoGPT, optimizer: nnx.Optimizer, micro_batches: dict):
+    acc_steps = config.accumulation_steps
+    
+    # 1. DISMANTLE: Rip the parameters out of the stateful model object
+    graphdef, params, rest = nnx.split(model, nnx.Param, ...)
+
+    # Initialize ZEROED accumulators in float32
+    zero_grads = jax.tree.map(lambda x: jnp.zeros_like(x, dtype=jnp.float32), params)
+    zero_loss = jnp.zeros((), dtype=jnp.float32)
+
+    def micro_step(carry, micro_batch):
+        acc_loss, acc_grads = carry
+        
+        # 2. REASSEMBLE: Define a pure function that temporarily rebuilds the model
+        def pure_loss_fn(p):
+            m = nnx.merge(graphdef, p, rest)
+            return loss_fn(m, micro_batch)
+
+        # 3. PURE MATH: Use JAX's standard autodiff, NOT nnx.value_and_grad
+        loss, grads = jax.value_and_grad(pure_loss_fn)(params)
+        
+        # UPCAST loss and gradients to float32 before doing accumulation math
+        loss = loss.astype(jnp.float32)
+        grads = jax.tree.map(lambda g: g.astype(jnp.float32), grads)
+        
+        # Accumulate the loss and gradients
+        acc_loss = acc_loss + (loss / acc_steps)
+        acc_grads = jax.tree.map(lambda a, g: a + (g / acc_steps), acc_grads, grads)
+        
+        return (acc_loss, acc_grads), None
+
+    # Run the XLA-optimized loop
+    (final_loss, final_grads), _ = jax.lax.scan(
+        micro_step, 
+        (zero_loss, zero_grads), 
+        micro_batches
+    )
+
+    # DOWNCAST the final accumulated gradients back to bfloat16
+    final_grads = jax.tree.map(lambda orig, g: g.astype(orig.dtype), params, final_grads)
+
+    # 4. UPDATE: Apply the accumulated gradients back to the original model
+    optimizer.update(model, final_grads)
+    return final_loss
 
 @nnx.jit
 def eval_step(model: NanoGPT, batch: dict):
     return loss_fn(model, batch)
 
 @nnx.jit
-def generate_token_step(model: NanoGPT, next_token: jax.Array, cache_index: jax.Array, prng_key: jax.Array):
-    logits = model(next_token, cache_index=cache_index)
-    
-    # Grab the logits for the very last token in the sequence
+def generate_token_step(model: NanoGPT, current_sequence: jax.Array, prng_key: jax.Array):
+    # Just pass the whole sequence through the stateless model
+    logits = model(current_sequence)
     next_token_logits = logits[:, -1, :] 
     
-    # --- ADD TEMPERATURE (Controls creativity. 1.0 is standard, 0.8 is focused) ---
     temperature = 0.8
     next_token_logits = next_token_logits / temperature
     
-    # --- ADD TOP-K (Prevents the model from picking total gibberish) ---
     top_k = 40
-    # Find the threshold of the 40th best word
     top_k_values, _ = jax.lax.top_k(next_token_logits, top_k)
     min_top_k = top_k_values[:, -1:]
-    # Mask out everything else by setting their probability to negative infinity
     next_token_logits = jnp.where(next_token_logits < min_top_k, -1e9, next_token_logits)
     
-    # Sample from the remaining probabilities
     new_token = jax.random.categorical(prng_key, next_token_logits)
     return jnp.expand_dims(new_token, axis=-1)
 
 def generate(model: NanoGPT, prompt_token: jax.Array, max_new_tokens: int, seed: int = 42):
-    current_token = prompt_token
-    generated = [current_token[0, 0].item()]
+    current_sequence = prompt_token
     key = jax.random.PRNGKey(seed)
     
-    # Generate token by token
-    for i in range(max_new_tokens):
+    for _ in range(max_new_tokens):
         key, subkey = jax.random.split(key)
-        cache_index = jnp.array(i, dtype=jnp.int32)
-        current_token = generate_token_step(model, current_token, cache_index, subkey)
+        # Generate the new token
+        new_token = generate_token_step(model, current_sequence, subkey)
+        # Append it to the sequence and feed the whole thing back in
+        current_sequence = jnp.concatenate([current_sequence, new_token], axis=1)
         
-        generated.append(current_token[0, 0].item())
-        
-    return generated
+    return np.array(current_sequence[0]).tolist()
 
 # ==========================================
 # 5. Main Execution Loop with DDP
@@ -272,7 +310,9 @@ def main():
     mesh = jax.sharding.Mesh(jax.devices(), ('data',))
     # We will shard the batch dimension of our data across the 'data' axis
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec('data', None))
-    # We want model weights replicated on all devices
+    # Accumulation sharding. We shard Axis 1 (MicroBatch), not Axis 0 (Steps)
+    acc_data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(None, 'data', None))
+    
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     # 2. Initialize Loaders
@@ -332,7 +372,8 @@ def main():
         max_to_keep=3, 
         create=True, 
         best_fn=lambda metrics: metrics['val_loss'],
-        best_mode='min'
+        best_mode='min',
+        enable_async_checkpointing=True
     )
     checkpoint_manager = ocp.CheckpointManager(
         run_checkpoint_dir, options=options, item_names=('state',)
@@ -366,9 +407,27 @@ def main():
         else:
             print(f"WARNING: No checkpoint found in {run_checkpoint_dir}. Starting from step 0.")
 
+    def run_validation():
+        val_losses = []
+        for val_batch in val_loader:
+            jax_val_batch = jax.tree.map(lambda x: jax.device_put(x, data_sharding), val_batch)
+            val_losses.append(eval_step(model, jax_val_batch))
+        
+        # Average on TPU, then bring to CPU
+        return float(jnp.mean(jnp.array(val_losses)))
+
     print("Compiling model (dummy step)...")
     dummy_batch = next(train_iterator)
-    jax_dummy_batch = {k: jax.device_put(jnp.array(v), data_sharding) for k, v in dummy_batch.items()}
+    
+    # --- NEW: Reshape the dummy batch exactly like the training loop ---
+    micro_b = config.batch_size // config.accumulation_steps
+    dummy_batch_reshaped = jax.tree.map(
+        lambda x: x.reshape(config.accumulation_steps, micro_b, *x.shape[1:]), 
+        dummy_batch
+    )
+    
+    # Push to TPU using the correct accumulation sharding spec
+    jax_dummy_batch = jax.tree.map(lambda x: jax.device_put(x, acc_data_sharding), dummy_batch_reshaped)
     
     # Run once to trigger JIT compilation
     dummy_loss = train_step(model, optimizer, jax_dummy_batch)
@@ -378,19 +437,30 @@ def main():
     print("Starting training loop...")
     start_time = time.time()
     for step in range(start_step + 1, config.total_steps + 1):
-        # Fetch batch and put it on the device mesh, sharded across devices
+        
         batch = next(train_iterator)
-        jax_batch = {k: jax.device_put(jnp.array(v), data_sharding) for k, v in batch.items()}
+        micro_b = config.batch_size // config.accumulation_steps
+        
+        # 1. Reshape the raw NumPy array: (1024, Seq) -> (16, 64, Seq)
+        batch_reshaped = jax.tree.map(
+            lambda x: x.reshape(config.accumulation_steps, micro_b, *x.shape[1:]), 
+            batch
+        )
+        
+        # 2. Push to TPU using the Axis-1 sharding spec
+        jax_batch = jax.tree.map(lambda x: jax.device_put(x, acc_data_sharding), batch_reshaped)
         
         loss = train_step(model, optimizer, jax_batch)
 
-        if step % 100 == 0:
+        if step % config.log_interval  == 0:
             loss.block_until_ready()
             end_time = time.time()
-            avg_step_time_ms = ((end_time - start_time) / 100) * 1000
-            print(f"Step {step} | Train Loss: {float(loss):.4f} | Avg Step Time: {avg_step_time_ms:.2f} ms")
+            avg_step_time_ms = ((end_time - start_time) / config.log_interval) * 1000
+            print(f"{Colors.BOLD}Step {step:05d}{Colors.RESET} | "
+                  f"Train Loss: {Colors.RED}{float(loss):.4f}{Colors.RESET} | "
+                  f"Time/Step: {avg_step_time_ms:.1f}ms")
             start_time = time.time()
-
+    
         # --- Generation ---
         if step % config.generate_every_n_steps == 0:
             rand_token = np.random.randint(0, config.vocab_size)
@@ -401,22 +471,28 @@ def main():
             token_list = generate(model, prompt, config.max_generate_length)
             decoded_text = tokenizer.decode(token_list)
             
-            print(f"\n--- Step {step} Generation ---")
-            print(f"Text:\n{decoded_text}\n------------------------------\n")
+            print()
+            print_divider(Colors.CYAN, "-")
+            print(f"{Colors.CYAN}{Colors.BOLD}🤖 GENERATION (Step {step}){Colors.RESET}")
+            print(f"{decoded_text}")
+            print_divider(Colors.CYAN, "-")
+            print()
 
         # --- Evaluation ---
-        if step % config.eval_every_n_steps == 0:
-            val_losses = []
-            for val_batch in val_loader:
-                jax_val_batch = {k: jax.device_put(jnp.array(v), data_sharding) for k, v in val_batch.items()}
-                val_losses.append(float(eval_step(model, jax_val_batch)))
-            
-            avg_val_loss = np.mean(val_losses)
-            print(f"\n--- Step {step} Eval | Val Loss: {float(avg_val_loss):.4f} ---\n")
+        # Avoid double eval on save steps
+        if step % config.eval_every_n_steps == 0 and step % config.save_every_n_steps != 0:
+            avg_val_loss_cpu = run_validation()
+            print(f"\n{Colors.GREEN}{Colors.BOLD}✔ EVALUATION (Step {step}){Colors.RESET} | "
+                  f"Val Loss: {Colors.GREEN}{avg_val_loss_cpu:.4f}{Colors.RESET}\n")
 
         # --- Checkpointing ---
         if step % config.save_every_n_steps == 0:
-            print(f"Saving checkpoint at step {step} to GCS...")
+            print_divider(Colors.YELLOW)
+            print(f"{Colors.YELLOW}{Colors.BOLD}💾 CHECKPOINT (Step {step}){Colors.RESET}")
+            
+            current_val_loss = run_validation()
+            print(f"   ↳ Val Loss: {Colors.GREEN}{current_val_loss:.4f}{Colors.RESET}")
+            print(f"   ↳ Uploading to GCS...")
             # Extract state dict for saving
             _, state = nnx.split((model, optimizer)) 
             checkpoint_manager.save(
@@ -424,8 +500,10 @@ def main():
                 args=ocp.args.Composite(
                     state=ocp.args.StandardSave(state)
                 ),
-                metrics={'val_loss': float(avg_val_loss)} # Every time checkpoint is run, validation is performed on the same state. eval_every_n_steps % save_every_n_steps == 0
+                metrics={'val_loss': float(current_val_loss)}
             )
+            print_divider(Colors.YELLOW)
+            print()
     print("Waiting for final checkpoint uploads to finish...")
     checkpoint_manager.wait_until_finished()
     
