@@ -511,3 +511,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+'''
+python tpu_train.py \
+    --resume_run_id "<run_id>" # Optional, only if you want to resume from a previous checkpoint
+'''
